@@ -159,6 +159,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* frequency_coefficients,
+	const int* frequency_coefficient_indices,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -173,8 +175,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
+	float* cov3Ds_periodic,
 	float* rgb,
 	float4* conic_opacity,
+	float3* conic_periodic,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -197,7 +201,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };	
+	glm::vec3 s = scales[idx];
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
@@ -208,7 +213,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 	else
 	{
-		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+		computeCov3D(s, scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 	}
 
@@ -235,6 +240,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
+
+	// If on image, compute the cov for the scaled gaussians due to 
+	// periodic effect
+	glm::vec3 s_scaled = glm::vec3(s.x/frequency_coefficient_indices[idx*4], s.y, s.z);
+	computeCov3D(s_scaled, scale_modifier, rotations[idx], cov3Ds_periodic + idx * 6);
+	cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, 
+		tan_fovy, cov3Ds_periodic + idx * 6, viewmatrix);
+	det = (cov.x * cov.z - cov.y * cov.y);
+	det_inv = 1.f / det;
+	conic_periodic[idx] = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -267,6 +282,7 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
+	const float3* __restrict__ conic_periodic,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -295,6 +311,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float3 collected_conic_periodic[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -318,6 +335,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_conic_periodic[block.thread_rank()] = conic_periodic[coll_id];
 		}
 		block.sync();
 
@@ -332,6 +350,7 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
+			float3 con_p = collected_conic_periodic[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
@@ -381,6 +400,7 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
+	const float3* conic_periodic,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -393,6 +413,7 @@ void FORWARD::render(
 		means2D,
 		colors,
 		conic_opacity,
+		conic_periodic,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -404,7 +425,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	const glm::vec3* scales,
 	const float scale_modifier,
 	const glm::vec4* rotations,
-	const float* opacities,
+	const float* opacities,	
+	const float* frequency_coefficients,
+	const int* frequency_coefficient_indices,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -419,8 +442,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* means2D,
 	float* depths,
 	float* cov3Ds,
+	float* cov3Ds_periodic,
 	float* rgb,
 	float4* conic_opacity,
+	float3* conic_periodic,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -432,6 +457,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		scale_modifier,
 		rotations,
 		opacities,
+		frequency_coefficients,
+		frequency_coefficient_indices,
 		shs,
 		clamped,
 		cov3D_precomp,
@@ -446,8 +473,10 @@ void FORWARD::preprocess(int P, int D, int M,
 		means2D,
 		depths,
 		cov3Ds,
+		cov3Ds_periodic,
 		rgb,
 		conic_opacity,
+		conic_periodic,
 		grid,
 		tiles_touched,
 		prefiltered

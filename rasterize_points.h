@@ -23,6 +23,8 @@ RasterizeGaussiansCUDA(
     const torch::Tensor& opacity,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
+	const torch::Tensor& frequency_coefficients,
+	const torch::Tensor& frequency_coefficient_indices,
 	const float scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,

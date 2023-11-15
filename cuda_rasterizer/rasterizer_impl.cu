@@ -160,7 +160,9 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
+	obtain(chunk, geom.cov3D_periodic, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
+	obtain(chunk, geom.conic_periodic, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
@@ -207,6 +209,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* colors_precomp,
 	const float* opacities,
 	const float* scales,
+	const float* frequency_coefficients,
+	const int* frequency_coefficient_indices,
 	const float scale_modifier,
 	const float* rotations,
 	const float* cov3D_precomp,
@@ -252,6 +256,8 @@ int CudaRasterizer::Rasterizer::forward(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
+		frequency_coefficients,
+		frequency_coefficient_indices,
 		shs,
 		geomState.clamped,
 		cov3D_precomp,
@@ -265,8 +271,10 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
+		geomState.cov3D_periodic,
 		geomState.rgb,
 		geomState.conic_opacity,
+		geomState.conic_periodic,
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered
@@ -274,7 +282,9 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, 
+		geomState.scan_size, geomState.tiles_touched, 
+		geomState.point_offsets, P), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
@@ -327,6 +337,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
+		geomState.conic_periodic,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
