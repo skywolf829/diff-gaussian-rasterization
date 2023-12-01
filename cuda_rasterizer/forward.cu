@@ -71,7 +71,8 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 }
 
 // Forward version of 2D covariance matrix computation
-__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
+__device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y, 
+	float tan_fovx, float tan_fovy, const float* cov3D, const float* viewmatrix)
 {
 	// The following models the steps outlined by equations 29
 	// and 31 in "EWA Splatting" (Zwicker et al., 2002). 
@@ -87,9 +88,9 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	t.y = min(limy, max(-limy, tytz)) * t.z;
 
 	glm::mat3 J = glm::mat3(
-		focal_x / t.z, 0.0f, -(focal_x * t.x) / (t.z * t.z),
-		0.0f, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
-		0, 0, 0);
+		focal_x / t.z, 	0.0f, 			-(focal_x * t.x) / (t.z * t.z),
+		0.0f, 			focal_y / t.z, 	-(focal_y * t.y) / (t.z * t.z),
+		0, 				0, 				0);
 
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
@@ -151,6 +152,44 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
+__device__ float3 computeCov3D_with_e1(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
+{
+	// Create scaling matrix
+	glm::mat3 S = glm::mat3(1.0f);
+	S[0][0] = mod * scale.x;
+	S[1][1] = mod * scale.y;
+	S[2][2] = mod * scale.z;
+
+	// Normalize quaternion to get valid rotation
+	glm::vec4 q = rot;// / glm::length(rot);
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
+
+	// Compute rotation matrix from quaternion
+	glm::mat3 R = glm::mat3(
+		1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat3 M = S * R;
+
+	float3 e1 = {M[0][0], M[0][1], M[0][2]};
+	// Compute 3D world covariance matrix Sigma
+	glm::mat3 Sigma = glm::transpose(M) * M;
+
+	// Covariance is symmetric, only store upper right
+	cov3D[0] = Sigma[0][0];
+	cov3D[1] = Sigma[0][1];
+	cov3D[2] = Sigma[0][2];
+	cov3D[3] = Sigma[1][1];
+	cov3D[4] = Sigma[1][2];
+	cov3D[5] = Sigma[2][2];
+	return e1;
+}
+
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
@@ -159,7 +198,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
-	const float* frequency_coefficients,
 	const int* frequency_coefficient_indices,
 	const float* shs,
 	bool* clamped,
@@ -179,6 +217,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* rgb,
 	float4* conic_opacity,
 	float3* conic_periodic,
+	float2* screen_space_wave_direction,
+	uint8_t* num_periods,
+	bool* into_screen,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -203,19 +244,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };	
 	glm::vec3 s = scales[idx];
-
-	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
-	const float* cov3D;
-	if (cov3D_precomp != nullptr)
-	{
-		cov3D = cov3D_precomp + idx * 6;
-	}
-	else
-	{
-		computeCov3D(s, scale_modifier, rotations[idx], cov3Ds + idx * 6);
-		cov3D = cov3Ds + idx * 6;
-	}
+	glm::vec4 r = rotations[idx];
+	// Compute cov3d from scaling and rotation parameters. 
+	float3 e1 = computeCov3D_with_e1(s, scale_modifier, r, cov3Ds + idx * 6);
+	const float* cov3D = cov3Ds + idx * 6;	
 
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
@@ -243,13 +275,27 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If on image, compute the cov for the scaled gaussians due to 
 	// periodic effect
-	glm::vec3 s_scaled = glm::vec3(s.x/frequency_coefficient_indices[idx*4], s.y, s.z);
-	computeCov3D(s_scaled, scale_modifier, rotations[idx], cov3Ds_periodic + idx * 6);
+	float f = max((float)frequency_coefficient_indices[idx], 0.001f);
+	float f_inv = 1 / f;
+	//glm::vec3 s_scaled = glm::vec3(s.x/f, s.y, s.z);
+	//computeCov3D(s_scaled, scale_modifier, r, cov3Ds_periodic + idx * 6);
+	cov3Ds_periodic[idx*6] = cov3D[0] * f_inv * f_inv;
+	cov3Ds_periodic[idx*6+1] = cov3D[1] * f_inv;
+	cov3Ds_periodic[idx*6+2] = cov3D[2] * f_inv;
+	cov3Ds_periodic[idx*6+3] = cov3D[3];
+	cov3Ds_periodic[idx*6+4] = cov3D[4];
+	cov3Ds_periodic[idx*6+5] = cov3D[5];
+
+	float3 world_space_wave = {2*3.14159*e1.x*f_inv + p_orig.x, 
+								2*3.14159*e1.y*f_inv + p_orig.y, 
+								2*3.14159*e1.z*f_inv + p_orig.z};
+	p_hom = transformPoint4x4(world_space_wave, projmatrix);
+	p_w = 1.0f / (p_hom.w + 0.0000001f);
+	float3 screen_space_wave = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };	
 	cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, 
 		tan_fovy, cov3Ds_periodic + idx * 6, viewmatrix);
 	det = (cov.x * cov.z - cov.y * cov.y);
 	det_inv = 1.f / det;
-	conic_periodic[idx] = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -267,6 +313,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
+	conic_periodic[idx] = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+	into_screen[idx] = screen_space_wave.z > p_proj.z;
+	num_periods[idx] = (uint8_t)max((int)(round((2.0f*f/3.14159f - 1) / 2.0f)), (int)0);
+	//screen_space_wave_direction[idx] = {ndc2Pix(screen_space_wave.x, W), 
+	//									ndc2Pix(screen_space_wave.y, H)};
+	screen_space_wave_direction[idx] = {ndc2Pix(screen_space_wave.x, W) - point_image.x, 
+										ndc2Pix(screen_space_wave.y, H) - point_image.y};
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -283,8 +336,12 @@ renderCUDA(
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
 	const float3* __restrict__ conic_periodic,
+	const float2* __restrict__ screen_space_wave_direction,
+	const uint8_t* __restrict__ num_periods,
+	const bool* __restrict__ into_screen,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
+	uint8_t* __restrict__ n_contrib_periodic,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color)
 {
@@ -312,11 +369,16 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float3 collected_conic_periodic[BLOCK_SIZE];
+	__shared__ float2 collected_screen_space_wave[BLOCK_SIZE];
+	__shared__ uint8_t collected_num_periods[BLOCK_SIZE];
+	__shared__ bool collected_into_screen[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
+	uint8_t periodic_contributor = 0;
+	uint8_t last_periodic_contributor = 0;
 	float C[CHANNELS] = { 0 };
 
 	// Iterate over batches until all done or range is complete
@@ -336,6 +398,8 @@ renderCUDA(
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			collected_conic_periodic[block.thread_rank()] = conic_periodic[coll_id];
+			collected_num_periods[block.thread_rank()] = num_periods[coll_id];
+			collected_screen_space_wave[block.thread_rank()] = screen_space_wave_direction[coll_id];
 		}
 		block.sync();
 
@@ -350,30 +414,54 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
-			float3 con_p = collected_conic_periodic[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
 
+			float3 con_p = collected_conic_periodic[j];
+			float2 screen_wave = collected_screen_space_wave[j];
+			uint8_t n_periods = collected_num_periods[j];
+			bool into = collected_into_screen[j];
+			
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
-				continue;
-			float test_T = T * (1 - alpha);
-			if (test_T < 0.0001f)
-			{
-				done = true;
-				continue;
+			// Avoid numerical instabilities (see paper appendix).
+			
+			int start = -((int)n_periods);
+			int end = ((int)n_periods);
+			int step = 1;
+			if(!into){
+				start = -start;
+				end = -end;
+				step = -1;
 			}
+			
+			periodic_contributor = 0;
+			bool finished_periodic = false;
+			for(int k = start; !done && !finished_periodic; k += step){
+				finished_periodic = (k == end);
+				periodic_contributor++;
+				float2 this_gaussian_center = {xy.x + k*screen_wave.x, xy.y + k*screen_wave.y};
+				float2 this_d = {this_gaussian_center.x - pixf.x, this_gaussian_center.y - pixf.y};
+				float p = -0.5f * (con_p.x * this_d.x * this_d.x + con_p.z * this_d.y * this_d.y) 
+					- con_p.y * this_d.x * this_d.y;
+				if(p + power > 0.0f) continue; // e^x * e^y = e^(xy)
+				float alpha = min(0.99f, con_o.w*exp(p + power));
+				if(alpha < 1.0f / 255.0f) continue;
+				float test_T = T * (1-alpha);
+				if (test_T < 0.0001f){
+					done = true;
+					continue;
+				}
+				// Eq. (3) from 3D Gaussian splatting paper.
+				for (int ch = 0; ch < CHANNELS; ch++)
+					C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
-			// Eq. (3) from 3D Gaussian splatting paper.
-			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-
-			T = test_T;
+				T = test_T;
+				// Keep track of last periodic prim 
+				last_periodic_contributor = periodic_contributor;	
+			}
 
 			// Keep track of last range entry to update this
 			// pixel.
@@ -387,6 +475,7 @@ renderCUDA(
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
+		n_contrib_periodic[pix_id] = last_periodic_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}
@@ -401,8 +490,12 @@ void FORWARD::render(
 	const float* colors,
 	const float4* conic_opacity,
 	const float3* conic_periodic,
+	const float2* screen_space_wave_direction,	
+	const uint8_t* num_periods,
+	const bool* into_screen,
 	float* final_T,
 	uint32_t* n_contrib,
+	uint8_t* n_contrib_periodic,
 	const float* bg_color,
 	float* out_color)
 {
@@ -414,8 +507,12 @@ void FORWARD::render(
 		colors,
 		conic_opacity,
 		conic_periodic,
+		screen_space_wave_direction,
+		num_periods,
+		into_screen,
 		final_T,
 		n_contrib,
+		n_contrib_periodic,
 		bg_color,
 		out_color);
 }
@@ -426,7 +523,6 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,	
-	const float* frequency_coefficients,
 	const int* frequency_coefficient_indices,
 	const float* shs,
 	bool* clamped,
@@ -446,6 +542,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* rgb,
 	float4* conic_opacity,
 	float3* conic_periodic,
+	float2* screen_space_wave_direction,
+	uint8_t* num_periods,
+	bool* into_screen,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -457,7 +556,6 @@ void FORWARD::preprocess(int P, int D, int M,
 		scale_modifier,
 		rotations,
 		opacities,
-		frequency_coefficients,
 		frequency_coefficient_indices,
 		shs,
 		clamped,
@@ -477,6 +575,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		rgb,
 		conic_opacity,
 		conic_periodic,
+		screen_space_wave_direction,
+		num_periods,
+		into_screen,
 		grid,
 		tiles_touched,
 		prefiltered

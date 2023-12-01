@@ -27,7 +27,6 @@ namespace FORWARD
 		const float scale_modifier,
 		const glm::vec4* rotations,
 		const float* opacities,		
-		const float* frequency_coefficients,
 		const int* frequency_coefficient_indices,
 		const float* shs,
 		bool* clamped,
@@ -47,6 +46,9 @@ namespace FORWARD
 		float* colors,
 		float4* conic_opacity,
 		float3* conic_periodic,
+		float2* screen_space_wave_direction,
+		uint8_t* num_periods,
+		bool* into_screen,
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered);
@@ -61,8 +63,12 @@ namespace FORWARD
 		const float* features,
 		const float4* conic_opacity,
 		const float3* conic_periodic,
+		const float2* screen_space_wave_direction,
+		const uint8_t* num_periods,
+		const bool* into_screen,
 		float* final_T,
 		uint32_t* n_contrib,
+		uint8_t* n_contrib_periodic,
 		const float* bg_color,
 		float* out_color);
 }

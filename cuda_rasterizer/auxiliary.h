@@ -54,6 +54,15 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
 	};
 }
+__forceinline__ __device__ float3 transformPoint3x3(const float3& p, const float* matrix)
+{
+	float3 transformed = {
+		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z,
+		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z,
+		matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z,
+	};
+	return transformed;
+}
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {

@@ -17,7 +17,8 @@ namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
-__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
+__device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means,
+glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
 {
 	// Compute intermediate values, as it is done during forward
 	glm::vec3 pos = means[idx];
@@ -175,7 +176,8 @@ __global__ void computeCov2DCUDA(int P,
 	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
 	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
 
-	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
+	glm::mat3 J = glm::mat3(
+		h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
 		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
 		0, 0, 0);
 
@@ -270,12 +272,16 @@ __global__ void computeCov2DCUDA(int P,
 	// Gradients of loss w.r.t. Gaussian means, but only the portion 
 	// that is caused because the mean affects the covariance matrix.
 	// Additional mean gradient is accumulated in BACKWARD::preprocess.
-	dL_dmeans[idx] = dL_dmean;
+	dL_dmeans[idx].x += dL_dmean.x;
+	dL_dmeans[idx].y += dL_dmean.y;
+	dL_dmeans[idx].z += dL_dmean.z;
 }
 
 // Backward pass for the conversion of scale and rotation to a 
 // 3D covariance matrix for each Gaussian. 
-__device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const glm::vec4 rot, const float* dL_dcov3Ds, glm::vec3* dL_dscales, glm::vec4* dL_drots)
+__device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, 
+const glm::vec4 rot, const float* dL_dcov3Ds, const int freq_coeff_ind,
+glm::vec3* dL_dscales, glm::vec4* dL_drots)
 {
 	// Recompute (intermediate) results for the 3D covariance computation.
 	glm::vec4 q = rot;// / glm::length(rot);
@@ -296,6 +302,7 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 	S[0][0] = s.x;
 	S[1][1] = s.y;
 	S[2][2] = s.z;
+	if(freq_coeff_ind > 1) S[0][0] /= freq_coeff_ind;
 
 	glm::mat3 M = S * R;
 
@@ -320,9 +327,9 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 
 	// Gradients of loss w.r.t. scale
 	glm::vec3* dL_dscale = dL_dscales + idx;
-	dL_dscale->x = glm::dot(Rt[0], dL_dMt[0]);
-	dL_dscale->y = glm::dot(Rt[1], dL_dMt[1]);
-	dL_dscale->z = glm::dot(Rt[2], dL_dMt[2]);
+	dL_dscale->x += glm::dot(Rt[0], dL_dMt[0]);
+	dL_dscale->y += glm::dot(Rt[1], dL_dMt[1]);
+	dL_dscale->z += glm::dot(Rt[2], dL_dMt[2]);
 
 	dL_dMt[0] *= s.x;
 	dL_dMt[1] *= s.y;
@@ -337,7 +344,12 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 
 	// Gradients of loss w.r.t. unnormalized quaternion
 	float4* dL_drot = (float4*)(dL_drots + idx);
-	*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };//dnormvdv(float4{ rot.x, rot.y, rot.z, rot.w }, float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w });
+	//*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };
+	dL_drot->x += dL_dq.x;
+	dL_drot->y += dL_dq.y;
+	dL_drot->z += dL_dq.z;
+	dL_drot->w += dL_dq.w;
+	//dnormvdv(float4{ rot.x, rot.y, rot.z, rot.w }, float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w });
 }
 
 // Backward pass of the preprocessing steps, except
@@ -355,6 +367,7 @@ __global__ void preprocessCUDA(
 	const float scale_modifier,
 	const float* proj,
 	const glm::vec3* campos,
+	const int* frequency_coefficient_indices,
 	const float3* dL_dmean2D,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
@@ -367,6 +380,7 @@ __global__ void preprocessCUDA(
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
+	const int freq_coeff_ind = (frequency_coefficient_indices == nullptr) ? 0 : frequency_coefficient_indices[idx];
 	float3 m = means[idx];
 
 	// Taking care of gradients from the screenspace points
@@ -375,24 +389,28 @@ __global__ void preprocessCUDA(
 
 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
 	// from rendering procedure
-	glm::vec3 dL_dmean;
-	float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
-	float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
-	dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
-	dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
-	dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
+	if(frequency_coefficient_indices == nullptr){
+		glm::vec3 dL_dmean;
+		float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
+		float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
+		dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dmean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dmean2D[idx].y;
+		dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
+		dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
 
-	// That's the second part of the mean gradient. Previous computation
-	// of cov2D and following SH conversion also affects it.
-	dL_dmeans[idx] += dL_dmean;
+		// That's the second part of the mean gradient. Previous computation
+		// of cov2D and following SH conversion also affects it.
+		dL_dmeans[idx] += dL_dmean;
 
-	// Compute gradient updates due to computing colors from SHs
-	if (shs)
-		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
-
+		// Compute gradient updates due to computing colors from SHs
+		if (shs)
+			computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, 
+			(glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
+	}
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
-		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
+		computeCov3D(idx, scales[idx], scale_modifier, 
+		rotations[idx], dL_dcov3D, freq_coeff_ind,
+		dL_dscale, dL_drot);
 }
 
 // Backward version of the rendering procedure.
@@ -405,12 +423,18 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
+	const float3* __restrict__ conic_periodic,
+	const float2* __restrict__ screen_space_wave_direction,
+	const uint8_t* __restrict__ num_periods,
+	const bool* __restrict__ into_screen,
 	const float* __restrict__ colors,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
+	const uint8_t* __restrict__ n_periodic_contrib,
 	const float* __restrict__ dL_dpixels,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
+	float4* __restrict__ dL_dconic2D_periodic,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors)
 {
@@ -434,6 +458,10 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float3 collected_conic_periodic[BLOCK_SIZE];
+	__shared__ float2 collected_screen_space_wave_direction[BLOCK_SIZE];
+	__shared__ uint8_t collected_num_periods[BLOCK_SIZE];
+	__shared__ bool collected_into_screen[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
@@ -473,6 +501,10 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_conic_periodic[block.thread_rank()] = conic_periodic[coll_id];
+			collected_screen_space_wave_direction[block.thread_rank()] = screen_space_wave_direction[coll_id];
+			collected_num_periods[block.thread_rank()] = num_periods[coll_id];
+			collected_into_screen[block.thread_rank()] = into_screen[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 		}
@@ -495,63 +527,100 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
-			if (alpha < 1.0f / 255.0f)
-				continue;
+			float3 con_p = collected_conic_periodic[j];
+			float2 screen_wave = collected_screen_space_wave_direction[j];
+			uint8_t n_periods = collected_num_periods[j];
+			bool into = collected_into_screen[j];
 
-			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
-
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-			float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
-			for (int ch = 0; ch < C; ch++)
-			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
-
-				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			int start = -((int)n_periods);
+			int end = ((int)n_periods);
+			int step = 1;
+			if(!into){
+				start = -start;
+				end = -end;
+				step = -1;
 			}
-			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
+			if(contributor == last_contributor){
+				end = start + step*(int)(n_periodic_contrib[pix_id]);
+			}
+			bool finished_periodic = false;
+			float G1 = exp(power);
 
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+			for(int k = end; !finished_periodic; k -= step){
+				finished_periodic = (k == start);
+				float2 this_gaussian_center = {xy.x + k*screen_wave.x, xy.y + k*screen_wave.y};
+				float2 this_d = {this_gaussian_center.x - pixf.x, this_gaussian_center.y - pixf.y};
+				float p = -0.5f * (con_p.x * this_d.x * this_d.x + con_p.z * this_d.y * this_d.y) 
+					- con_p.y * this_d.x * this_d.y;
+				if(p + power > 0.0f) continue; // e^x * e^y = e^(x+y)
+				float G2 = exp(p);
+				float alpha = min(0.99f, con_o.w*G1*G2);
+				if(alpha < 1.0f / 255.0f) continue;
+
+				T = T / (1.f - alpha);
+				
+				const float dchannel_dcolor = alpha * T;
+
+				// Propagate gradients to per-Gaussian colors and keep
+				// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+				// pair).
+				float dL_dalpha = 0.0f;
+				const int global_id = collected_id[j];
+				for (int ch = 0; ch < C; ch++)
+				{
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
+
+					const float dL_dchannel = dL_dpixel[ch];
+					dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+					// Update the gradients w.r.t. color of the Gaussian. 
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				}	
+				dL_dalpha *= T;
+				// Update last alpha (to be used in the next iteration)
+				last_alpha = alpha;
+				// Account for fact that alpha also influences how much of
+				// the background color is added if nothing left to blend
+				float bg_dot_dpixel = 0;
+				for (int i = 0; i < C; i++)
+					bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+				dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+				// Helpful reusable temporary variables
+				const float dL_dG = con_o.w * dL_dalpha;
+				
+				const float g1dx = G1 * d.x;
+				const float g1dy = G1 * d.y;
+				const float g2dx = G2 * this_d.x;
+				const float g2dy = G2 * this_d.y;
+				const float dG1_ddelx = -g1dx * con_o.x - g1dy * con_o.y;
+				const float dG1_ddely = -g1dy * con_o.z - g1dx * con_o.y;
+				const float dG2_ddelx = -g2dx * con_p.x - g2dy * con_p.y;
+				const float dG2_ddely = -g2dy * con_p.z - g2dx * con_p.y;
+				const float dG_ddelx = G2*dG1_ddelx + G1*dG2_ddelx;
+				const float dG_ddely = G2*dG1_ddely + G1*dG2_ddely;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+				// Update gradients w.r.t. 2D mean position of the Gaussian
+				
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+				// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				atomicAdd(&dL_dconic2D[global_id].x, -0.5f * g1dx * d.x * dL_dG * G2);
+				atomicAdd(&dL_dconic2D[global_id].y, -0.5f * g1dx * d.y * dL_dG * G2);
+				atomicAdd(&dL_dconic2D[global_id].w, -0.5f * g1dy * d.y * dL_dG * G2);
+				atomicAdd(&dL_dconic2D_periodic[global_id].x, -0.5f * g2dx * this_d.x * dL_dG * G1);
+				atomicAdd(&dL_dconic2D_periodic[global_id].y, -0.5f * g2dx * this_d.y * dL_dG * G1);
+				atomicAdd(&dL_dconic2D_periodic[global_id].w, -0.5f * g2dy * this_d.y * dL_dG * G1);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				// Update gradients w.r.t. opacity of the Gaussian
+				atomicAdd(&(dL_dopacity[global_id]), G1 * G2 * dL_dalpha);
+			}
 		}
 	}
 }
@@ -566,16 +635,20 @@ void BACKWARD::preprocess(
 	const glm::vec4* rotations,
 	const float scale_modifier,
 	const float* cov3Ds,
+	const float* cov3Ds_periodic,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
+	const int* frequency_coefficient_indices,
 	const float3* dL_dmean2D,
 	const float* dL_dconic,
+	const float* dL_dconic_periodic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
 	float* dL_dcov3D,
+	float* dL_dcov3D_periodic,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
@@ -597,7 +670,21 @@ void BACKWARD::preprocess(
 		dL_dconic,
 		(float3*)dL_dmean3D,
 		dL_dcov3D);
-
+	
+	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
+		P,
+		means3D,
+		radii,
+		cov3Ds_periodic,
+		focal_x,
+		focal_y,
+		tan_fovx,
+		tan_fovy,
+		viewmatrix,
+		dL_dconic_periodic,
+		(float3*)dL_dmean3D,
+		dL_dcov3D_periodic);
+	
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
@@ -612,10 +699,31 @@ void BACKWARD::preprocess(
 		scale_modifier,
 		projmatrix,
 		campos,
+		nullptr,
 		(float3*)dL_dmean2D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
+		dL_dsh,
+		dL_dscale,
+		dL_drot);
+	
+	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
+		P, D, M,
+		(float3*)means3D,
+		radii,
+		shs,
+		clamped,
+		(glm::vec3*)scales,
+		(glm::vec4*)rotations,
+		scale_modifier,
+		projmatrix,
+		campos,
+		frequency_coefficient_indices,
+		(float3*)dL_dmean2D,
+		(glm::vec3*)dL_dmean3D,
+		dL_dcolor,
+		dL_dcov3D_periodic,
 		dL_dsh,
 		dL_dscale,
 		dL_drot);
@@ -629,12 +737,18 @@ void BACKWARD::render(
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
+	const float3* conic_periodic,
+	const float2* screen_space_wave_direction,
+	const uint8_t* num_periods,
+	const bool* into_screen,
 	const float* colors,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
+	const uint8_t* n_periodic_contrib,
 	const float* dL_dpixels,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
+	float4* dL_dconic2D_periodic,
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
@@ -645,12 +759,18 @@ void BACKWARD::render(
 		bg_color,
 		means2D,
 		conic_opacity,
+		conic_periodic,
+		screen_space_wave_direction,
+		num_periods,
+		into_screen,
 		colors,
 		final_Ts,
 		n_contrib,
+		n_periodic_contrib,
 		dL_dpixels,
 		dL_dmean2D,
 		dL_dconic2D,
+		dL_dconic2D_periodic,
 		dL_dopacity,
 		dL_dcolors
 		);

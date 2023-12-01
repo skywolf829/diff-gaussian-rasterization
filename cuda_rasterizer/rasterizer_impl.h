@@ -38,6 +38,9 @@ namespace CudaRasterizer
 		float* cov3D_periodic;
 		float4* conic_opacity;
 		float3* conic_periodic;
+		float2* screen_space_wave_direction;
+		uint8_t* num_periods;
+		bool* into_screen;
 		float* rgb;
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
@@ -48,7 +51,8 @@ namespace CudaRasterizer
 	struct ImageState
 	{
 		uint2* ranges;
-		uint32_t* n_contrib;
+		uint32_t* n_contrib; // Number of gaussians that contribute to this single pixel
+		uint8_t* n_contrib_periodic; // Number of periodic gaussians rendered in final contributor (all before must have rendered all)
 		float* accum_alpha;
 
 		static ImageState fromChunk(char*& chunk, size_t N);

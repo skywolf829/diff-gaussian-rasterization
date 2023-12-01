@@ -163,6 +163,9 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.cov3D_periodic, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.conic_periodic, P, 128);
+	obtain(chunk, geom.screen_space_wave_direction, P, 128);
+	obtain(chunk, geom.num_periods, P, 128);
+	obtain(chunk, geom.into_screen, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
@@ -176,6 +179,7 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	ImageState img;
 	obtain(chunk, img.accum_alpha, N, 128);
 	obtain(chunk, img.n_contrib, N, 128);
+	obtain(chunk, img.n_contrib_periodic, N, 128);
 	obtain(chunk, img.ranges, N, 128);
 	return img;
 }
@@ -209,7 +213,6 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* colors_precomp,
 	const float* opacities,
 	const float* scales,
-	const float* frequency_coefficients,
 	const int* frequency_coefficient_indices,
 	const float scale_modifier,
 	const float* rotations,
@@ -256,7 +259,6 @@ int CudaRasterizer::Rasterizer::forward(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
-		frequency_coefficients,
 		frequency_coefficient_indices,
 		shs,
 		geomState.clamped,
@@ -275,10 +277,14 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.rgb,
 		geomState.conic_opacity,
 		geomState.conic_periodic,
+		geomState.screen_space_wave_direction,
+		geomState.num_periods,
+		geomState.into_screen,
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered
 	), debug)
+
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
@@ -289,6 +295,20 @@ int CudaRasterizer::Rasterizer::forward(
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+
+	// debug print stuff
+	/*
+	float2* abc = (float2*)malloc(P*sizeof(float2));
+	uint8_t* abcd = (uint8_t*)malloc(P*sizeof(uint8_t));
+	int* r = (int*)malloc(P*sizeof(int));
+	cudaMemcpy(abc, geomState.screen_space_wave_direction, sizeof(float2)*P, cudaMemcpyDeviceToHost);
+	cudaMemcpy(abcd, geomState.num_periods, sizeof(uint8_t)*P, cudaMemcpyDeviceToHost);
+	cudaMemcpy(r, radii, sizeof(int)*P, cudaMemcpyDeviceToHost);
+	for(int iii = 0; iii < P; iii++){
+		std::cout << r[iii] << " " << +(abcd[iii]) << " - " << abc[iii].x << ", " << abc[iii].y << " " << std::endl;
+	}
+	std::cout << std::endl;
+	*/
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -338,8 +358,12 @@ int CudaRasterizer::Rasterizer::forward(
 		feature_ptr,
 		geomState.conic_opacity,
 		geomState.conic_periodic,
+		geomState.screen_space_wave_direction,
+		geomState.num_periods,
+		geomState.into_screen,
 		imgState.accum_alpha,
 		imgState.n_contrib,
+		imgState.n_contrib_periodic,
 		background,
 		out_color), debug)
 
@@ -356,6 +380,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* shs,
 	const float* colors_precomp,
 	const float* scales,
+	const int* frequency_coefficient_indices,
 	const float scale_modifier,
 	const float* rotations,
 	const float* cov3D_precomp,
@@ -370,10 +395,12 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* dL_dpix,
 	float* dL_dmean2D,
 	float* dL_dconic,
+	float* dL_dconic_periodic,
 	float* dL_dopacity,
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
+	float* dL_dcov3D_periodic,
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
@@ -407,12 +434,18 @@ void CudaRasterizer::Rasterizer::backward(
 		background,
 		geomState.means2D,
 		geomState.conic_opacity,
+		geomState.conic_periodic,
+		geomState.screen_space_wave_direction,
+		geomState.num_periods,
+		geomState.into_screen,
 		color_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
+		imgState.n_contrib_periodic,
 		dL_dpix,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
+		(float4*)dL_dconic_periodic,
 		dL_dopacity,
 		dL_dcolor), debug)
 
@@ -429,16 +462,20 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec4*)rotations,
 		scale_modifier,
 		cov3D_ptr,
+		geomState.cov3D_periodic,
 		viewmatrix,
 		projmatrix,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,
+		frequency_coefficient_indices,
 		(float3*)dL_dmean2D,
 		dL_dconic,
+		dL_dconic_periodic,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
+		dL_dcov3D_periodic,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot), debug)
