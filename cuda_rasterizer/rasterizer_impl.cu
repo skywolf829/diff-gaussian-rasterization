@@ -160,9 +160,8 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
-	obtain(chunk, geom.cov3D_periodic, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
-	obtain(chunk, geom.conic_periodic, P, 128);
+	obtain(chunk, geom.world_space_wave_direction, P, 128);
 	obtain(chunk, geom.screen_space_wave_direction, P, 128);
 	obtain(chunk, geom.num_periods, P, 128);
 	obtain(chunk, geom.into_screen, P, 128);
@@ -273,10 +272,9 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
-		geomState.cov3D_periodic,
 		geomState.rgb,
 		geomState.conic_opacity,
-		geomState.conic_periodic,
+		geomState.world_space_wave_direction,
 		geomState.screen_space_wave_direction,
 		geomState.num_periods,
 		geomState.into_screen,
@@ -295,20 +293,6 @@ int CudaRasterizer::Rasterizer::forward(
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
-
-	// debug print stuff
-	/*
-	float2* abc = (float2*)malloc(P*sizeof(float2));
-	uint8_t* abcd = (uint8_t*)malloc(P*sizeof(uint8_t));
-	int* r = (int*)malloc(P*sizeof(int));
-	cudaMemcpy(abc, geomState.screen_space_wave_direction, sizeof(float2)*P, cudaMemcpyDeviceToHost);
-	cudaMemcpy(abcd, geomState.num_periods, sizeof(uint8_t)*P, cudaMemcpyDeviceToHost);
-	cudaMemcpy(r, radii, sizeof(int)*P, cudaMemcpyDeviceToHost);
-	for(int iii = 0; iii < P; iii++){
-		std::cout << r[iii] << " " << +(abcd[iii]) << " - " << abc[iii].x << ", " << abc[iii].y << " " << std::endl;
-	}
-	std::cout << std::endl;
-	*/
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -357,8 +341,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
-		geomState.conic_periodic,
 		geomState.screen_space_wave_direction,
+		frequency_coefficient_indices,
 		geomState.num_periods,
 		geomState.into_screen,
 		imgState.accum_alpha,
@@ -394,13 +378,10 @@ void CudaRasterizer::Rasterizer::backward(
 	char* img_buffer,
 	const float* dL_dpix,
 	float* dL_dmean2D,
-	float* dL_dconic,
-	float* dL_dconic_periodic,
 	float* dL_dopacity,
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
-	float* dL_dcov3D_periodic,
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
@@ -424,6 +405,7 @@ void CudaRasterizer::Rasterizer::backward(
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
+	
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
@@ -431,11 +413,17 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		viewmatrix,
 		background,
+		(float3*)means3D,
+		geomState.cov3D,
 		geomState.means2D,
 		geomState.conic_opacity,
-		geomState.conic_periodic,
+		geomState.world_space_wave_direction,
 		geomState.screen_space_wave_direction,
+		frequency_coefficient_indices,
 		geomState.num_periods,
 		geomState.into_screen,
 		color_ptr,
@@ -443,12 +431,13 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.n_contrib,
 		imgState.n_contrib_periodic,
 		dL_dpix,
-		(float3*)dL_dmean2D,
-		(float4*)dL_dconic,
-		(float4*)dL_dconic_periodic,
+		(float2*)dL_dmean2D,
+		(float3*)dL_dmean3D,
+		dL_dcov3D,
 		dL_dopacity,
 		dL_dcolor), debug)
-
+	
+	
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
@@ -462,7 +451,6 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec4*)rotations,
 		scale_modifier,
 		cov3D_ptr,
-		geomState.cov3D_periodic,
 		viewmatrix,
 		projmatrix,
 		focal_x, focal_y,
@@ -470,13 +458,18 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec3*)campos,
 		frequency_coefficient_indices,
 		(float3*)dL_dmean2D,
-		dL_dconic,
-		dL_dconic_periodic,
+		dL_dcov3D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
-		dL_dcov3D,
-		dL_dcov3D_periodic,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot), debug)
+	// debug print stuff
+	/*
+	float* abc = (float*)malloc(P*3*sizeof(float));
+	cudaMemcpy(abc, dL_dscale, sizeof(float)*P*3, cudaMemcpyDeviceToHost);
+	for(int iii = 0; iii < 3; iii+=3){
+		std::cout << abc[iii] << " " << abc[iii+1] << " " <<abc[iii+2] << std::endl;
+	}
+	*/
 }

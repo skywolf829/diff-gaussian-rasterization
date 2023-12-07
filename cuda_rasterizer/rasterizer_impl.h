@@ -35,9 +35,8 @@ namespace CudaRasterizer
 		int* internal_radii;
 		float2* means2D;
 		float* cov3D;
-		float* cov3D_periodic;
 		float4* conic_opacity;
-		float3* conic_periodic;
+		float3* world_space_wave_direction;
 		float2* screen_space_wave_direction;
 		uint8_t* num_periods;
 		bool* into_screen;

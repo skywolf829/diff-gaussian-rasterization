@@ -213,10 +213,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* cov3Ds,
-	float* cov3Ds_periodic,
 	float* rgb,
 	float4* conic_opacity,
-	float3* conic_periodic,
+	float3* world_space_wave_direction,
 	float2* screen_space_wave_direction,
 	uint8_t* num_periods,
 	bool* into_screen,
@@ -245,19 +244,17 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };	
 	glm::vec3 s = scales[idx];
 	glm::vec4 r = rotations[idx];
+	float cov3D_full[6];	
 	// Compute cov3d from scaling and rotation parameters. 
-	float3 e1 = computeCov3D_with_e1(s, scale_modifier, r, cov3Ds + idx * 6);
-	const float* cov3D = cov3Ds + idx * 6;	
+	float3 e1 = computeCov3D_with_e1(s, scale_modifier, r, cov3D_full);
 
 	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D_full, viewmatrix);
 
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
 	if (det == 0.0f)
 		return;
-	float det_inv = 1.f / det;
-	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
@@ -275,27 +272,30 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If on image, compute the cov for the scaled gaussians due to 
 	// periodic effect
-	float f = max((float)frequency_coefficient_indices[idx], 0.001f);
-	float f_inv = 1 / f;
+	float f = max((float)frequency_coefficient_indices[idx], 1.0f);
+	float f_inv = 1.0f / f;
 	//glm::vec3 s_scaled = glm::vec3(s.x/f, s.y, s.z);
 	//computeCov3D(s_scaled, scale_modifier, r, cov3Ds_periodic + idx * 6);
-	cov3Ds_periodic[idx*6] = cov3D[0] * f_inv * f_inv;
-	cov3Ds_periodic[idx*6+1] = cov3D[1] * f_inv;
-	cov3Ds_periodic[idx*6+2] = cov3D[2] * f_inv;
-	cov3Ds_periodic[idx*6+3] = cov3D[3];
-	cov3Ds_periodic[idx*6+4] = cov3D[4];
-	cov3Ds_periodic[idx*6+5] = cov3D[5];
+	cov3Ds[idx*6] = cov3D_full[0] * f_inv * f_inv;
+	cov3Ds[idx*6+1] = cov3D_full[1] * f_inv;
+	cov3Ds[idx*6+2] = cov3D_full[2] * f_inv;
+	cov3Ds[idx*6+3] = cov3D_full[3];
+	cov3Ds[idx*6+4] = cov3D_full[4];
+	cov3Ds[idx*6+5] = cov3D_full[5];
 
-	float3 world_space_wave = {2*3.14159*e1.x*f_inv + p_orig.x, 
+	float3 world_space_wave = {	2*3.14159*e1.x*f_inv + p_orig.x, 
 								2*3.14159*e1.y*f_inv + p_orig.y, 
 								2*3.14159*e1.z*f_inv + p_orig.z};
+	world_space_wave_direction[idx] = world_space_wave;
+
 	p_hom = transformPoint4x4(world_space_wave, projmatrix);
 	p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 screen_space_wave = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };	
 	cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, 
-		tan_fovy, cov3Ds_periodic + idx * 6, viewmatrix);
+		tan_fovy, cov3Ds + idx * 6, viewmatrix);
 	det = (cov.x * cov.z - cov.y * cov.y);
-	det_inv = 1.f / det;
+	float det_inv = 1.f / det;
+	conic_opacity[idx] = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv, opacities[idx] };
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
@@ -312,12 +312,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
-	conic_periodic[idx] = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 	into_screen[idx] = screen_space_wave.z > p_proj.z;
 	num_periods[idx] = (uint8_t)max((int)(round((2.0f*f/3.14159f - 1) / 2.0f)), (int)0);
-	//screen_space_wave_direction[idx] = {ndc2Pix(screen_space_wave.x, W), 
-	//									ndc2Pix(screen_space_wave.y, H)};
 	screen_space_wave_direction[idx] = {ndc2Pix(screen_space_wave.x, W) - point_image.x, 
 										ndc2Pix(screen_space_wave.y, H) - point_image.y};
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
@@ -335,8 +331,8 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
-	const float3* __restrict__ conic_periodic,
 	const float2* __restrict__ screen_space_wave_direction,
+	const int* __restrict__ frequencies,
 	const uint8_t* __restrict__ num_periods,
 	const bool* __restrict__ into_screen,
 	float* __restrict__ final_T,
@@ -368,8 +364,8 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-	__shared__ float3 collected_conic_periodic[BLOCK_SIZE];
 	__shared__ float2 collected_screen_space_wave[BLOCK_SIZE];
+	__shared__ int collected_frequency[BLOCK_SIZE];
 	__shared__ uint8_t collected_num_periods[BLOCK_SIZE];
 	__shared__ bool collected_into_screen[BLOCK_SIZE];
 
@@ -397,9 +393,10 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			collected_conic_periodic[block.thread_rank()] = conic_periodic[coll_id];
 			collected_num_periods[block.thread_rank()] = num_periods[coll_id];
+			collected_frequency[block.thread_rank()] = frequencies[coll_id];
 			collected_screen_space_wave[block.thread_rank()] = screen_space_wave_direction[coll_id];
+			collected_into_screen[block.thread_rank()] = into_screen[coll_id];
 		}
 		block.sync();
 
@@ -412,14 +409,9 @@ renderCUDA(
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
-
-			float3 con_p = collected_conic_periodic[j];
 			float2 screen_wave = collected_screen_space_wave[j];
+			int freq = max((int)1,collected_frequency[j]);
 			uint8_t n_periods = collected_num_periods[j];
 			bool into = collected_into_screen[j];
 			
@@ -442,12 +434,13 @@ renderCUDA(
 			for(int k = start; !done && !finished_periodic; k += step){
 				finished_periodic = (k == end);
 				periodic_contributor++;
-				float2 this_gaussian_center = {xy.x + k*screen_wave.x, xy.y + k*screen_wave.y};
-				float2 this_d = {this_gaussian_center.x - pixf.x, this_gaussian_center.y - pixf.y};
-				float p = -0.5f * (con_p.x * this_d.x * this_d.x + con_p.z * this_d.y * this_d.y) 
-					- con_p.y * this_d.x * this_d.y;
-				if(p + power > 0.0f) continue; // e^x * e^y = e^(xy)
-				float alpha = min(0.99f, con_o.w*exp(p + power));
+				float2 d = { xy.x + k*screen_wave.x - pixf.x, xy.y + k*screen_wave.y - pixf.y };
+				float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+				if (power > 0.0f)
+					continue;
+				float scaling_constant = 2*3.141592f*k/((float)freq);
+				scaling_constant = exp(-(scaling_constant*scaling_constant));
+				float alpha = min(0.99f, scaling_constant*con_o.w*exp(power));
 				if(alpha < 1.0f / 255.0f) continue;
 				float test_T = T * (1-alpha);
 				if (test_T < 0.0001f){
@@ -489,8 +482,8 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
-	const float3* conic_periodic,
 	const float2* screen_space_wave_direction,	
+	const int* frequencies,
 	const uint8_t* num_periods,
 	const bool* into_screen,
 	float* final_T,
@@ -506,8 +499,8 @@ void FORWARD::render(
 		means2D,
 		colors,
 		conic_opacity,
-		conic_periodic,
 		screen_space_wave_direction,
+		frequencies,
 		num_periods,
 		into_screen,
 		final_T,
@@ -538,10 +531,9 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* means2D,
 	float* depths,
 	float* cov3Ds,
-	float* cov3Ds_periodic,
 	float* rgb,
 	float4* conic_opacity,
-	float3* conic_periodic,
+	float3* world_space_wave_direction,
 	float2* screen_space_wave_direction,
 	uint8_t* num_periods,
 	bool* into_screen,
@@ -571,10 +563,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		means2D,
 		depths,
 		cov3Ds,
-		cov3Ds_periodic,
 		rgb,
 		conic_opacity,
-		conic_periodic,
+		world_space_wave_direction,
 		screen_space_wave_direction,
 		num_periods,
 		into_screen,
