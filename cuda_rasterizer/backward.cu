@@ -141,8 +141,6 @@ const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3
 }
 
 // Backward version of INVERSE 2D covariance matrix computation
-// (due to length launched as separate kernel before other 
-// backward steps contained in preprocess)
 __device__ void computeCov2DCUDA(
 	const float3 mean,
 	const float* cov3D,
@@ -284,7 +282,7 @@ glm::vec3* dL_dscales, glm::vec4* dL_drots)
 	);
 
 	glm::mat3 S = glm::mat3(1.0f);
-	float freq_mult = 1 / max(1.0f, (float)freq_coeff_ind);
+	float freq_mult = 1.0f / max(1.0f, (float)freq_coeff_ind);
 	glm::vec3 s = mod * scale;
 	S[0][0] = s.x*freq_mult;
 	S[1][1] = s.y;
@@ -354,7 +352,7 @@ __global__ void preprocessCUDA(
 	const float* proj,
 	const glm::vec3* campos,
 	const int* frequency_coefficient_indices,
-	const float3* dL_dmean2D,
+	const float2* dL_dmean2D,
 	const float* dL_dcov3D,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
@@ -519,7 +517,7 @@ renderCUDA(
 			float4 con_o = collected_conic_opacity[j];
 			float3 world_wave = collected_world_space_wave_direction[j];
 			float2 screen_wave = collected_screen_space_wave_direction[j];
-			int freq = max((int)1,collected_frequency[j]);
+			float freq = max(1.0f, (float)collected_frequency[j]);
 			uint8_t n_periods = collected_num_periods[j];
 			bool into = collected_into_screen[j];
 
@@ -531,12 +529,12 @@ renderCUDA(
 				end = -end;
 				step = -1;
 			}
-			if(contributor == last_contributor){
+			if(contributor == last_contributor - 1){
 				end = start + step*(int)(n_periodic_contrib[pix_id]);
 			}
 			bool finished_periodic = false;
 
-			for(int k = end; !finished_periodic; k -= step){
+			for(int k = end; !finished_periodic && !done; k -= step){
 				finished_periodic = (k == start);
 				float2 d = { xy.x + k*screen_wave.x - pixf.x, xy.y + k*screen_wave.y - pixf.y };
 				float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
@@ -641,7 +639,7 @@ void BACKWARD::preprocess(
 	const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
 	const int* frequency_coefficient_indices,
-	const float3* dL_dmean2D,
+	const float2* dL_dmean2D,
 	const float* dL_dcov3D,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
@@ -665,7 +663,7 @@ void BACKWARD::preprocess(
 		projmatrix,
 		campos,
 		frequency_coefficient_indices,
-		(float3*)dL_dmean2D,
+		dL_dmean2D,
 		dL_dcov3D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,

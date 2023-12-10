@@ -65,7 +65,7 @@ namespace BACKWARD
 		const float tan_fovx, float tan_fovy,
 		const glm::vec3* campos,
 		const int* frequencies,
-		const float3* dL_dmean2D,
+		const float2* dL_dmean2D,
 		const float* dL_dcov3D,
 		glm::vec3* dL_dmeans,
 		float* dL_dcolor,

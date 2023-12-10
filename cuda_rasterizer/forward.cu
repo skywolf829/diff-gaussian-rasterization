@@ -152,7 +152,8 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
-__device__ float3 computeCov3D_with_e1(const glm::vec3 scale, float mod, const glm::vec4 rot, float* cov3D)
+__device__ float3 computeCov3D_with_e1(const glm::vec3 scale, float mod, 
+	const glm::vec4 rot, float* cov3D)
 {
 	// Create scaling matrix
 	glm::mat3 S = glm::mat3(1.0f);
@@ -248,8 +249,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute cov3d from scaling and rotation parameters. 
 	float3 e1 = computeCov3D_with_e1(s, scale_modifier, r, cov3D_full);
 
-	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D_full, viewmatrix);
+	// Compute 2D screen-space covariance matrix for group of gaussians
+	float3 cov = computeCov2D(p_orig, focal_x, focal_y, 
+		tan_fovx, tan_fovy, cov3D_full, viewmatrix);
 
 	// Invert covariance (EWA algorithm)
 	float det = (cov.x * cov.z - cov.y * cov.y);
@@ -275,8 +277,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float f = max((float)frequency_coefficient_indices[idx], 1.0f);
 	float f_inv = 1.0f / f;
 	//glm::vec3 s_scaled = glm::vec3(s.x/f, s.y, s.z);
-	//computeCov3D(s_scaled, scale_modifier, r, cov3Ds_periodic + idx * 6);
-	cov3Ds[idx*6] = cov3D_full[0] * f_inv * f_inv;
+	//computeCov3D(s_scaled, scale_modifier, r, cov3Ds + idx * 6);
+	cov3Ds[idx*6] = cov3D_full[0]* f_inv * f_inv;
 	cov3Ds[idx*6+1] = cov3D_full[1] * f_inv;
 	cov3Ds[idx*6+2] = cov3D_full[2] * f_inv;
 	cov3Ds[idx*6+3] = cov3D_full[3];
@@ -351,7 +353,7 @@ renderCUDA(
 	float2 pixf = { (float)pix.x, (float)pix.y };
 
 	// Check if this thread is associated with a valid pixel or outside.
-	bool inside = pix.x < W&& pix.y < H;
+	bool inside = pix.x < W && pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
@@ -411,7 +413,7 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float4 con_o = collected_conic_opacity[j];
 			float2 screen_wave = collected_screen_space_wave[j];
-			int freq = max((int)1,collected_frequency[j]);
+			float freq = max(1.0f, (float)collected_frequency[j]);
 			uint8_t n_periods = collected_num_periods[j];
 			bool into = collected_into_screen[j];
 			
@@ -431,6 +433,7 @@ renderCUDA(
 			
 			periodic_contributor = 0;
 			bool finished_periodic = false;
+			bool one_contributed = false;
 			for(int k = start; !done && !finished_periodic; k += step){
 				finished_periodic = (k == end);
 				periodic_contributor++;
@@ -451,14 +454,13 @@ renderCUDA(
 				for (int ch = 0; ch < CHANNELS; ch++)
 					C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
-				T = test_T;
-				// Keep track of last periodic prim 
+				T = test_T; 
 				last_periodic_contributor = periodic_contributor;	
+				one_contributed = true;
 			}
-
 			// Keep track of last range entry to update this
 			// pixel.
-			last_contributor = contributor;
+			if(one_contributed) last_contributor = contributor;
 		}
 	}
 

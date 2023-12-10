@@ -457,7 +457,7 @@ void CudaRasterizer::Rasterizer::backward(
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,
 		frequency_coefficient_indices,
-		(float3*)dL_dmean2D,
+		(float2*)dL_dmean2D,
 		dL_dcov3D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
