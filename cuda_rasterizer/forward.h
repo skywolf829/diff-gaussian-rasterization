@@ -44,7 +44,6 @@ namespace FORWARD
 		float* cov3Ds,
 		float* colors,
 		float4* conic_opacity,
-		float3* world_space_wave_direction,
 		float2* screen_space_wave_direction,
 		uint8_t* num_periods,
 		bool* into_screen,

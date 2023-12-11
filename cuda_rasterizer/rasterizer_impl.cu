@@ -161,7 +161,6 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
-	obtain(chunk, geom.world_space_wave_direction, P, 128);
 	obtain(chunk, geom.screen_space_wave_direction, P, 128);
 	obtain(chunk, geom.num_periods, P, 128);
 	obtain(chunk, geom.into_screen, P, 128);
@@ -274,7 +273,6 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.cov3D,
 		geomState.rgb,
 		geomState.conic_opacity,
-		geomState.world_space_wave_direction,
 		geomState.screen_space_wave_direction,
 		geomState.num_periods,
 		geomState.into_screen,
@@ -418,11 +416,9 @@ void CudaRasterizer::Rasterizer::backward(
 		tan_fovx, tan_fovy,
 		viewmatrix,
 		background,
-		(float3*)means3D,
 		geomState.cov3D,
 		geomState.means2D,
 		geomState.conic_opacity,
-		geomState.world_space_wave_direction,
 		geomState.screen_space_wave_direction,
 		frequency_coefficient_indices,
 		geomState.num_periods,

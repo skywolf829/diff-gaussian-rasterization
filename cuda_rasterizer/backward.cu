@@ -543,11 +543,9 @@ renderCUDA(
 	const float tan_fovx, const float tan_fovy,
 	const float* viewmatrix,
 	const float* __restrict__ bg_color,
-	const float3* __restrict__ means3D,
 	const float* __restrict__ cov3D,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
-	const float3* __restrict__ world_space_wave_direction,
 	const float2* __restrict__ screen_space_wave_direction,
 	const int* __restrict__ frequency_coefficient_indices,
 	const uint8_t* __restrict__ num_periods,
@@ -583,9 +581,7 @@ renderCUDA(
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float3 collected_xyz[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-	__shared__ float3 collected_world_space_wave_direction[BLOCK_SIZE];
 	__shared__ float2 collected_screen_space_wave_direction[BLOCK_SIZE];
 	__shared__ int collected_frequency[BLOCK_SIZE];
 	__shared__ uint8_t collected_num_periods[BLOCK_SIZE];
@@ -628,9 +624,7 @@ renderCUDA(
 			const int coll_id = point_list[range.y - progress - 1];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_xyz[block.thread_rank()] = means3D[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			collected_world_space_wave_direction[block.thread_rank()] = world_space_wave_direction[coll_id];
 			collected_screen_space_wave_direction[block.thread_rank()] = screen_space_wave_direction[coll_id];
 			collected_frequency[block.thread_rank()] = frequency_coefficient_indices[coll_id];
 			collected_num_periods[block.thread_rank()] = num_periods[coll_id];
@@ -651,9 +645,7 @@ renderCUDA(
 
 			// Compute blending values, as before.
 			float2 xy = collected_xy[j];
-			const float3 xyz = collected_xyz[j];
 			float4 con_o = collected_conic_opacity[j];
-			float3 world_wave = collected_world_space_wave_direction[j];
 			float2 screen_wave = collected_screen_space_wave_direction[j];
 			float freq = max(1.0f, (float)collected_frequency[j]);
 			uint8_t n_periods = collected_num_periods[j];
@@ -835,11 +827,9 @@ void BACKWARD::render(
 	const float tan_fovx, const float tan_fovy,
 	const float* viewmatrix,
 	const float* bg_color,
-	const float3* means3D,
 	const float* cov3D,
 	const float2* means2D,
 	const float4* conic_opacity,
-	const float3* world_space_wave_direction,
 	const float2* screen_space_wave_direction,
 	const int* frequency_coefficient_indices,
 	const uint8_t* num_periods,
@@ -864,11 +854,9 @@ void BACKWARD::render(
 		tan_fovx, tan_fovy,
 		viewmatrix,
 		bg_color,
-		means3D,
 		cov3D,
 		means2D,
 		conic_opacity,
-		world_space_wave_direction,
 		screen_space_wave_direction,
 		frequency_coefficient_indices,
 		num_periods,
