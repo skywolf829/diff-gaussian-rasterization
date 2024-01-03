@@ -273,7 +273,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If on image, compute the cov for the scaled gaussians due to 
 	// periodic effect
-	float f = max((float)frequency_coefficient_indices[idx], 1.0f);
+	float f = max(4*(float)frequency_coefficient_indices[idx], 1.0f);
 	float f_inv = 1.0f / f;
 	//glm::vec3 s_scaled = glm::vec3(s.x/f, s.y, s.z);
 	//computeCov3D(s_scaled, scale_modifier, r, cov3Ds + idx * 6);
@@ -284,9 +284,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	cov3Ds[idx*6+4] = cov3D_full[4];
 	cov3Ds[idx*6+5] = cov3D_full[5];
 
-	float3 world_space_wave = {	2*3.14159*e1.x*f_inv + p_orig.x, 
-								2*3.14159*e1.y*f_inv + p_orig.y, 
-								2*3.14159*e1.z*f_inv + p_orig.z};
+	float3 world_space_wave = {	2*3.14159f*e1.x*f_inv + p_orig.x, 
+								2*3.14159f*e1.y*f_inv + p_orig.y, 
+								2*3.14159f*e1.z*f_inv + p_orig.z};
 
 	p_hom = transformPoint4x4(world_space_wave, projmatrix);
 	p_w = 1.0f / (p_hom.w + 0.0000001f);
@@ -411,7 +411,7 @@ renderCUDA(
 			float2 xy = collected_xy[j];
 			float4 con_o = collected_conic_opacity[j];
 			float2 screen_wave = collected_screen_space_wave[j];
-			float freq = max(1.0f, (float)collected_frequency[j]);
+			float freq = max(1.0f, 4*(float)collected_frequency[j]);
 			uint8_t n_periods = collected_num_periods[j];
 			bool into = collected_into_screen[j];
 			
@@ -420,29 +420,27 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix).
 			
-			int start = -((int)n_periods);
-			int end = ((int)n_periods);
-			int step = 1;
-			if(!into){
-				start = -start;
-				end = -end;
-				step = -1;
+			int start = ((int)n_periods);
+			int end = -((int)n_periods);
+			int step = -1;
+			if(into){
+				start = -((int)n_periods);
+				end = ((int)n_periods);
+				step = 1;
 			}
 			
 			periodic_contributor = 0;
 			bool finished_periodic = false;
-			bool one_contributed = false;
 			for(int k = start; !done && !finished_periodic; k += step){
-				finished_periodic = (k == end);
 				periodic_contributor++;
+				finished_periodic = (k == end);
 				float2 d = { xy.x + k*screen_wave.x - pixf.x, xy.y + k*screen_wave.y - pixf.y };
 				float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-				if (power > 0.0f)
-					continue;
-				float scaling_constant = 2*3.141592f*k/((float)freq);
+				if (power > 0.0f) continue;
+				float scaling_constant = 2*3.141592f*k/freq;
 				scaling_constant = exp(-(scaling_constant*scaling_constant));
 				float alpha = min(0.99f, scaling_constant*con_o.w*exp(power));
-				if(alpha < 1.0f / 255.0f) continue;
+				if(alpha < 0.000001f) continue;
 				float test_T = T * (1-alpha);
 				if (test_T < 0.0001f){
 					done = true;
@@ -453,12 +451,11 @@ renderCUDA(
 					C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
 				T = test_T; 
+				// Keep track of last range entry to update this
+				// pixel.
 				last_periodic_contributor = periodic_contributor;	
-				one_contributed = true;
+				last_contributor = contributor;
 			}
-			// Keep track of last range entry to update this
-			// pixel.
-			if(one_contributed) last_contributor = contributor;
 		}
 	}
 
@@ -468,7 +465,7 @@ renderCUDA(
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
-		n_contrib_periodic[pix_id] = last_periodic_contributor;
+		n_contrib_periodic[pix_id] = last_periodic_contributor-1;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 	}

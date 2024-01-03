@@ -420,7 +420,7 @@ glm::vec3* dL_dscales, glm::vec4* dL_drots)
 	);
 
 	glm::mat3 S = glm::mat3(1.0f);
-	float freq_mult = 1.0f / max(1.0f, (float)freq_coeff_ind);
+	float freq_mult = 1.0f / max(1.0f, 4*(float)freq_coeff_ind);
 	glm::vec3 s = mod * scale;
 	S[0][0] = s.x*freq_mult;
 	S[1][1] = s.y;
@@ -629,8 +629,8 @@ renderCUDA(
 			collected_frequency[block.thread_rank()] = frequency_coefficient_indices[coll_id];
 			collected_num_periods[block.thread_rank()] = num_periods[coll_id];
 			collected_into_screen[block.thread_rank()] = into_screen[coll_id];
-			for (int i = 0; i < C; i++)
-				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int j = 0; j < C; j++)
+				collected_colors[j * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + j];
 		}
 		block.sync();
 
@@ -644,38 +644,41 @@ renderCUDA(
 				continue;
 
 			// Compute blending values, as before.
+			const int global_id = collected_id[j];
 			float2 xy = collected_xy[j];
 			float4 con_o = collected_conic_opacity[j];
 			float2 screen_wave = collected_screen_space_wave_direction[j];
-			float freq = max(1.0f, (float)collected_frequency[j]);
+			float freq = max(1.0f, 4*(float)collected_frequency[j]);
 			uint8_t n_periods = collected_num_periods[j];
 			bool into = collected_into_screen[j];
 
-			int start = -((int)n_periods);
-			int end = ((int)n_periods);
-			int step = 1;
-			if(!into){
-				start = -start;
-				end = -end;
-				step = -1;
+			int start = ((int)n_periods);
+			int end = -((int)n_periods);
+			int step = -1;
+			if(into){
+				start = -((int)n_periods);
+				end = ((int)n_periods);
+				step = 1;
 			}
 			if(contributor == last_contributor - 1){
 				end = start + step*(int)(n_periodic_contrib[pix_id]);
 			}
 			bool finished_periodic = false;
+			
+			float inv_n_gaussians = 1.0f / (1 + 2*n_periods);
 
 			for(int k = end; !finished_periodic && !done; k -= step){
 				finished_periodic = (k == start);
 				float2 d = { xy.x + k*screen_wave.x - pixf.x, xy.y + k*screen_wave.y - pixf.y };
 				float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-				if (power > 0.0f)
-					continue;
-				float scaling_constant = 2*3.141592f*k/((float)freq);
+				if (power > 0.0f) continue;
+				float scaling_constant = 2*3.141592f*k/freq;
 				scaling_constant = exp(-(scaling_constant*scaling_constant));
 				float G = exp(power);
 				float alpha = min(0.99f, scaling_constant*con_o.w*G);
-				if(alpha < 1.0f / 255.0f) continue;
-
+				//if(alpha < 1f/255f) continue;
+				if(alpha < 0.000001f) continue;
+				
 				T = T / (1.f - alpha);
 				
 				const float dchannel_dcolor = alpha * T;
@@ -684,7 +687,6 @@ renderCUDA(
 				// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 				// pair).
 				float dL_dalpha = 0.0f;
-				const int global_id = collected_id[j];
 				for (int ch = 0; ch < C; ch++)
 				{
 					const float c = collected_colors[ch * BLOCK_SIZE + j];
@@ -705,8 +707,8 @@ renderCUDA(
 				// Account for fact that alpha also influences how much of
 				// the background color is added if nothing left to blend
 				float bg_dot_dpixel = 0;
-				for (int i = 0; i < C; i++)
-					bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+				for (int ch = 0; ch < C; ch++)
+					bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
 				dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
@@ -717,39 +719,18 @@ renderCUDA(
 				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
 				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-				// Update gradients w.r.t. 2D mean position of the Gaussian
+				// Finally do the atomic adds since other pixels could have 
+				// updated this value as well. Divide by n_gaussians (repetitions)
+				// so that each primitive has a similar loss value for weight
+				// update.
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
-
-				
-				// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
 				atomicAdd(&dL_dconic[global_id].x, -0.5f * gdx * d.x * dL_dG);
 				atomicAdd(&dL_dconic[global_id].y, -0.5f * gdx * d.y * dL_dG);
 				atomicAdd(&dL_dconic[global_id].w, -0.5f * gdy * d.y * dL_dG);
-				
-				// Update gradients w.r.t. opacity of the Gaussian
 				atomicAdd(&(dL_dopacity[global_id]), G * scaling_constant * dL_dalpha);
-
-				/*
-				float3 dL_dconic2D = {-0.5f * gdx * d.x * dL_dG, 
-										-0.5f * gdx * d.y * dL_dG, 
-										-0.5f * gdy * d.y * dL_dG};
-				float3 xyz_offset = {xyz.x+k*world_wave.x,
-									xyz.y+k*world_wave.y,
-									xyz.z+k*world_wave.z};
-				
-				computeCov2DCUDA(
-					xyz_offset, // needs 3D pos + periodic direction
-					cov3D + 6*global_id, // needs the precomputed cov3D matrix (same for all periodic gaussians in this gaussian)
-					focal_x, focal_y, // needs focal x,y
-					tan_fovx, tan_fovy, // more view params
-					viewmatrix, // view matrix
-					dL_dconic2D, //computed dL_dconic from above
-					dL_dmean3D + global_id, // output gradient w.r.t. 3D mean
-					dL_dcovs3D + 6*global_id // output gradient w.r.t 3D cov matrix
-					);
-				*/
 			}
+
 		}
 	}
 }
